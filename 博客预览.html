@@ -366,7 +366,7 @@ if __name__ == &quot;__main__&quot;:
 <p><strong>题目要求</strong>：熟练掌握 Scrapy 的 Item、Pipeline 数据序列化方法，用 Scrapy + XPath + MySQL 存储技术路线爬取股票信息与外汇牌价。</p>
 <p>数据库统一使用 MySQL 8.0.28（绿色解压版，端口 3306），库名 <code>spider_db</code>，两题各一张表：<code>stock_info</code>、<code>boc_forex</code>。</p>
 <h4 id="2-a-148">作业②：东方财富 A 股行情（148 只）</h4>
-<p><strong>一个绕不过去的技术坎</strong>：东方财富的行情页 <code>quote.eastmoney.com/center/gridlist.html</code> 现在完全是前端渲染，HTML 里只有骨架没有一行数据；数据由 <code>push2.eastmoney.com</code> 的接口异步推送，而且该接口对非浏览器的 TLS 指纹<strong>直接断连</strong>（<code>requests</code> 请求一律 <code>RemoteDisconnected</code>，<code>push2</code>/<code>1.push2</code>/<code>82.push2</code>/<code>push2delay</code> 各节点都试过）。用无头浏览器打开页面也渲染不出表格——页面组件依赖的外部资源在本地环境被拦断。</p>
+<p><strong>一个绕不过去的技术坎</strong>：东方财富的行情页 <code>quote.eastmoney.com/center/gridlist.html</code> 现在完全是前端渲染，HTML 里只有骨架没有一行数据；数据由 <code>push2.eastmoney.com</code> 的接口异步推送。而该接口对普通 <code>requests</code> 请求一律直接断连（<code>RemoteDisconnected</code>，<code>push2</code>、<code>1.push2</code>、<code>82.push2</code>、<code>push2delay</code> 各节点都试过），同一个地址换到浏览器上下文里 <code>fetch</code> 却返回 200——说明拦截发生在连接层，不是参数或 UA 写错了。用无头浏览器直接打开行情页也渲染不出表格，页面组件依赖的外部资源在本地环境被拦断。</p>
 <p>所以采集拆成两步：先用 Playwright 驱动真实浏览器，在页面上下文内 <code>fetch</code> 接口把 JSON 取回来落盘；再由 Scrapy 的 Spider 读这份数据，走标准的 <code>Item -&gt; Pipeline -&gt; MySQL</code>。取数脚本：</p>
 <pre><code class="language-python"># -*- coding: utf-8 -*-
 &quot;&quot;&quot;作业②：东方财富行情数据采集（浏览器上下文取数）。
@@ -848,7 +848,7 @@ class ForexSpider(scrapy.Spider):
 <p><strong>2. XPath 的前提是「页面里真的有 HTML」。</strong></p>
 <p>作业② 是这次最深的教训。XPath 再熟也没用——对象根本不存在。东方财富把行情做成了纯 JSON 接口，页面上没有表格节点，<code>response.xpath()</code> 拿到的只有骨架。这不是 XPath 的问题，而是「解析方法必须匹配数据的形态」：数据在 HTML 里用 XPath，数据在 JSON 里就该用字典取键。作业③ 的中行牌价页则相反，老老实实的 HTML 表格，几行 XPath 就取完了。<strong>同一门课的两道题，恰好演示了这两种情况。</strong></p>
 <p><strong>3. 反爬不是「加个 UA」就能过。</strong></p>
-<p><code>requests</code> 请求东财接口被断连，但同一个 URL 在浏览器里 <code>fetch</code> 就 200——差别不在 header，而在 TLS 握手指纹。这说明服务端能做的不只是看 UA，还能看连接本身的特征。遇到这种拦截，硬刚没有意义，正确做法是让程序「真的像一个浏览器」（本作业用的是 Playwright），或者换一个数据源。识别出「这是指纹层面的拦截而不是我的参数写错了」，比多试十次 header 有用得多。</p>
+<p><code>requests</code> 请求东财接口被断连，但同一个 URL 在浏览器里 <code>fetch</code> 就 200——差别不在 header 和参数，而在连接本身的特征。这说明服务端能做的不只是看 UA，还能识别连接是谁发起的。遇到这种拦截，硬刚没有意义（换十个 UA 都一样），正确做法是让程序「真的像一个浏览器」（本作业用的是 Playwright），或者换一个数据源。<strong>能识别出「这是连接层拦截而不是我参数写错了」，比盲目重试有价值得多</strong>——否则会把时间全花在改 header 上。</p>
 <p><strong>4. 数据库字段类型是设计决策，不是随手写。</strong></p>
 <p><code>latest_price DECIMAL(12,3)</code>、<code>volume BIGINT</code>、<code>change_percent DECIMAL(10,3)</code>——这些不是随便挑的。价格用 <code>DECIMAL</code> 而不是 <code>FLOAT</code>，是因为浮点数存钱会出现 <code>21.659999847</code> 这种尾巴；成交量用 <code>BIGINT</code> 是因为「手」数乘 100 后可能过亿。另外两张表都加了唯一键（<code>stock_code</code> / <code>(currency, quote_time)</code>），配合 <code>ON DUPLICATE KEY UPDATE</code>，同一份数据重跑不会产生重复行——这一点在调试阶段反复跑爬虫时太重要了。</p>
 <p><strong>5. 一个环境上的坑：中文路径。</strong></p>
