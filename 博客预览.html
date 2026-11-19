@@ -1,0 +1,856 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<title>102402148 周凯 第三次作业</title>
+<style>
+body { max-width: 900px; margin: 0 auto; padding: 30px 24px 80px;
+        font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+        line-height: 1.85; color: #24292e; background: #fff; }
+h1 { font-size: 27px; border-bottom: 3px solid #2c5f8a; padding-bottom: 12px;
+      color: #16324f; }
+h2 { font-size: 22px; margin-top: 44px; padding-left: 12px;
+      border-left: 5px solid #2c5f8a; color: #16324f; }
+h3 { font-size: 18px; margin-top: 30px; color: #2c5f8a; }
+blockquote { margin: 16px 0; padding: 10px 16px; background: #f2f7fb;
+             border-left: 4px solid #9dc3e0; color: #42576b; font-size: 14px; }
+pre { background: #272822; color: #f8f8f2; padding: 14px 18px; border-radius: 6px;
+       overflow-x: auto; font-size: 12.5px; line-height: 1.5; }
+code { font-family: Consolas, "Courier New", monospace; }
+p code, li code { background: #f2f4f7; color: #b03060; padding: 1px 5px;
+                  border-radius: 3px; font-size: 13px; }
+img { max-width: 100%; border: 1px solid #e2e8ee; border-radius: 5px;
+       margin: 14px 0; display: block; }
+table { border-collapse: collapse; margin: 16px 0; font-size: 13.5px; }
+th { background: #2c5f8a; color: #fff; padding: 7px 12px; }
+td { border: 1px solid #d8e2ea; padding: 6px 12px; }
+tr:nth-child(even) td { background: #f6f9fc; }
+strong { color: #16324f; }
+hr { border: none; border-top: 1px dashed #ccd8e2; margin: 34px 0; }
+</style></head><body>
+<h1 id="_1">数据采集与融合技术 第三次作业</h1>
+<blockquote>
+<p>学号：102402148　姓名：周凯　完成时间：2026-11-19</p>
+<p>本次作业共三题：①图片爬虫（单线程/多线程，48 页 / 148 张）；②东方财富股票行情（Scrapy + MySQL）；③中国银行外汇牌价（Scrapy + XPath + MySQL）。下面按「图片爬虫」和「Scrapy 框架采集」两个大标题展开。</p>
+</blockquote>
+<hr />
+<h2 id="_2">一、图片爬虫：单线程与多线程的两种实现</h2>
+<h3 id="11">1.1 代码与运行结果</h3>
+<p><strong>题目要求</strong>：指定一个网站，爬取该网站中的所有图片，用单线程和多线程两种方式实现，并控制总页数与总图片数。</p>
+<p><strong>站点选择</strong>：作业举例是中国气象网，实测发现 <code>p.weather.com.cn</code> 的图片频道是 404 跳转页，全站只有首页 14 篇图集，<code>/photo/</code>、<code>/tuji/</code>、<code>/index_1.shtml</code> 都指向同一个 9KB 页面，<strong>没有可翻页的列表</strong>；中国气象局官网的图片新闻栏目也只有 17 条、一页列完。凑不出 48 页，所以改用<strong>当当网搜索结果页</strong>（<code>search.dangdang.com</code>）：<code>page_index</code> 参数可以直接翻页，每页固定 60 件商品，服务端渲染，是最适合练「翻页 + 限流 + 并发下载」的站点。</p>
+<p><strong>两个约束由学号推出</strong>：学号 <code>102402148</code>，后 2 位 <code>48</code> → 总页数上限 48 页；后 3 位 <code>148</code> → 图片数上限 148 张。代码里把这两个值写成常量，改学号即可复用。</p>
+<h4 id="_3">核心代码</h4>
+<p>完整程序（含单线程与多线程两套下载逻辑）：</p>
+<pre><code class="language-python"># -*- coding: utf-8 -*-
+&quot;&quot;&quot;第三次作业 作业①：图片爬虫（单线程 / 多线程两种实现）。
+
+目标站点：当当网搜索结果页（https://search.dangdang.com/）
+爬取思路：
+    1. 按 page_index 逐页抓列表页，解析出每件商品的图片地址；
+    2. 把 200px 的中图地址（-1_b_）换成原图地址（-1_u_）；
+    3. 地址去重后截断到学号规定的图片上限；
+    4. 分别用单线程和多线程把图片下载到 images/ 目录，并统计耗时。
+
+学号 102402148：
+    总页数上限   = 学号后 2 位  -&gt; 48 页
+    图片数量上限 = 学号后 3 位  -&gt; 148 张
+
+用法：
+    python dd_image_crawler.py --mode single
+    python dd_image_crawler.py --mode multi --threads 10
+&quot;&quot;&quot;
+
+import argparse
+import os
+import queue
+import re
+import threading
+import time
+from urllib.parse import quote
+
+import requests
+
+# ---------------------------------------------------------------- 全局配置
+
+# 学号推导出的两个约束值，改学号只需改这里
+STU_ID = &quot;102402148&quot;
+MAX_PAGES = int(STU_ID[-2:])          # 48 页
+MAX_IMAGES = int(STU_ID[-3:])         # 148 张
+
+KEYWORD = &quot;书包&quot;
+BASE_URL = &quot;https://search.dangdang.com/&quot;
+
+# 图片保存目录（相对本文件所在目录，避免受启动位置影响）
+IMG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), &quot;images&quot;)
+
+# 请求头，带上 UA 与来源，避免服务端直接拒绝
+HEADERS = {
+    &quot;User-Agent&quot;: (
+        &quot;Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 &quot;
+        &quot;(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36&quot;
+    ),
+    &quot;Referer&quot;: &quot;https://www.dangdang.com/&quot;,
+}
+
+# 商品图地址：src 或 data-original 都兼容，单双引号都收
+IMG_PATTERN = re.compile(r&quot;&quot;&quot;(?:src|data-original)=['&quot;](//img[^'&quot;]*?-1_b_[^'&quot;]+\.jpg)['&quot;]&quot;&quot;&quot;)
+
+# 列表页请求超时（秒）
+PAGE_TIMEOUT = 20
+# 图片请求超时（秒）
+IMG_TIMEOUT = 30
+
+
+# ---------------------------------------------------------------- 抓取列表页
+
+def build_page_url(page_index):
+    &quot;&quot;&quot;拼出第 page_index 页的搜索地址。
+
+    :param page_index: 页码，从 1 开始
+    :return: 完整 URL
+    &quot;&quot;&quot;
+    return f&quot;{BASE_URL}?key={quote(KEYWORD)}&amp;act=input&amp;page_index={page_index}&quot;
+
+
+def fetch_html(url, retry=3):
+    &quot;&quot;&quot;抓取一个页面并返回 HTML 文本。
+
+    当当搜索页是 GBK 编码，直接按 GBK 解码，避免中文变乱码。
+
+    :param url: 页面地址
+    :param retry: 失败重试次数
+    :return: HTML 字符串，全部失败返回空串
+    &quot;&quot;&quot;
+    for attempt in range(1, retry + 1):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=PAGE_TIMEOUT)
+            resp.encoding = &quot;gbk&quot;
+            return resp.text
+        except requests.RequestException as exc:
+            print(f&quot;[警告] 第 {attempt} 次抓取失败：{url} -&gt; {exc}&quot;)
+            time.sleep(1)
+    return &quot;&quot;
+
+
+def parse_image_urls(html):
+    &quot;&quot;&quot;从列表页 HTML 中提取商品图地址。
+
+    :param html: 列表页文本
+    :return: 图片地址列表（已转为 https 绝对地址与原图尺寸）
+    &quot;&quot;&quot;
+    urls = []
+    for raw in IMG_PATTERN.findall(html):
+        # 页面里是 //img3m9.ddimg.cn/... 这种缺协议的地址
+        full = &quot;https:&quot; + raw
+        # -1_b_ 是 200px 中图，-1_u_ 是原图，替换后清晰度更高
+        urls.append(full.replace(&quot;-1_b_&quot;, &quot;-1_u_&quot;))
+    return urls
+
+
+def collect_image_urls(max_pages=MAX_PAGES, limit=MAX_IMAGES):
+    &quot;&quot;&quot;翻页收集图片地址，去重后截断到上限。
+
+    :param max_pages: 最多翻多少页
+    :param limit: 最多收集多少个图片地址
+    :return: (图片地址列表, 实际翻页数)
+    &quot;&quot;&quot;
+    seen = set()
+    result = []
+    pages_done = 0
+
+    for page_index in range(1, max_pages + 1):
+        if len(result) &gt;= limit:
+            break
+        url = build_page_url(page_index)
+        html = fetch_html(url)
+        if not html:
+            print(f&quot;[警告] 第 {page_index} 页为空，跳过&quot;)
+            continue
+
+        pages_done += 1
+        page_urls = parse_image_urls(html)
+        added = 0
+        for img_url in page_urls:
+            if img_url in seen:
+                continue
+            seen.add(img_url)
+            result.append(img_url)
+            added += 1
+            if len(result) &gt;= limit:
+                break
+        print(f&quot;[列表] 第 {page_index:&gt;2} 页：本页解析 {len(page_urls)} 张，新增 {added} 张，累计 {len(result)} 张&quot;)
+
+    return result[:limit], pages_done
+
+
+# ---------------------------------------------------------------- 下载图片
+
+def make_filename(index, img_url):
+    &quot;&quot;&quot;根据序号与地址生成保存文件名。
+
+    优先用当当的商品编号（形如 1508098919），便于追溯来源。
+
+    :param index: 序号，从 1 开始
+    :param img_url: 图片地址
+    :return: 文件名
+    &quot;&quot;&quot;
+    match = re.search(r&quot;/(\d+)-1_u_&quot;, img_url)
+    goods_id = match.group(1) if match else str(index)
+    return f&quot;{index:03d}_{goods_id}.jpg&quot;
+
+
+def save_image(index, img_url, lock=None):
+    &quot;&quot;&quot;下载一张图片并写入 images 目录。
+
+    :param index: 序号，用于命名与保序
+    :param img_url: 图片地址
+    :param lock: 多线程时传入的锁，用于串行化打印
+    :return: (序号, 地址, 文件名, 字节数, 是否成功)
+    &quot;&quot;&quot;
+    filename = make_filename(index, img_url)
+    path = os.path.join(IMG_DIR, filename)
+    try:
+        resp = requests.get(img_url, headers=HEADERS, timeout=IMG_TIMEOUT)
+        if resp.status_code != 200 or not resp.content:
+            raise ValueError(f&quot;HTTP {resp.status_code}&quot;)
+        with open(path, &quot;wb&quot;) as fp:
+            fp.write(resp.content)
+        if lock:
+            with lock:
+                print(f&quot;[下载] {filename:&lt;22} {len(resp.content):&gt;8} 字节  {img_url}&quot;)
+        else:
+            print(f&quot;[下载] {filename:&lt;22} {len(resp.content):&gt;8} 字节  {img_url}&quot;)
+        return index, img_url, filename, len(resp.content), True
+    except Exception as exc:
+        if lock:
+            with lock:
+                print(f&quot;[失败] {filename:&lt;22} {exc}  {img_url}&quot;)
+        else:
+            print(f&quot;[失败] {filename:&lt;22} {exc}  {img_url}&quot;)
+        return index, img_url, filename, 0, False
+
+
+def download_single(urls):
+    &quot;&quot;&quot;单线程：按顺序一张张下载。
+
+    :param urls: 图片地址列表
+    :return: (成功数, 总字节数, 耗时秒)
+    &quot;&quot;&quot;
+    start = time.perf_counter()
+    ok_count = 0
+    total_bytes = 0
+    for i, url in enumerate(urls, start=1):
+        _, _, _, size, ok = save_image(i, url)
+        if ok:
+            ok_count += 1
+            total_bytes += size
+    return ok_count, total_bytes, time.perf_counter() - start
+
+
+def download_multi(urls, threads=10):
+    &quot;&quot;&quot;多线程：把任务放进队列，由多个线程并发消费。
+
+    结果按下标写回列表，保证顺序与 URL 列表一致（不能用 append，否则乱序）。
+
+    :param urls: 图片地址列表
+    :param threads: 线程数
+    :return: (成功数, 总字节数, 耗时秒)
+    &quot;&quot;&quot;
+    task_queue = queue.Queue()
+    for i, url in enumerate(urls, start=1):
+        task_queue.put((i, url))
+
+    lock = threading.Lock()
+    results = {}
+
+    def worker():
+        &quot;&quot;&quot;线程工作函数：不断取任务直到队列为空。&quot;&quot;&quot;
+        while True:
+            try:
+                index, url = task_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                _, _, _, size, ok = save_image(index, url, lock)
+                results[index] = (ok, size)
+            finally:
+                task_queue.task_done()
+
+    start = time.perf_counter()
+    workers = [threading.Thread(target=worker, name=f&quot;downloader-{k}&quot;) for k in range(threads)]
+    for t in workers:
+        t.start()
+    for t in workers:
+        t.join()
+    elapsed = time.perf_counter() - start
+
+    ok_count = sum(1 for ok, _ in results.values() if ok)
+    total_bytes = sum(size for ok, size in results.values() if ok)
+    return ok_count, total_bytes, elapsed
+
+
+# ---------------------------------------------------------------- 入口
+
+def parse_args():
+    &quot;&quot;&quot;解析命令行参数。
+
+    :return: argparse.Namespace
+    &quot;&quot;&quot;
+    parser = argparse.ArgumentParser(description=&quot;当当商品图片爬虫：单线程 / 多线程&quot;)
+    parser.add_argument(&quot;--mode&quot;, choices=[&quot;single&quot;, &quot;multi&quot;, &quot;both&quot;], default=&quot;both&quot;,
+                        help=&quot;single=仅单线程，multi=仅多线程，both=先单后多（默认）&quot;)
+    parser.add_argument(&quot;--threads&quot;, type=int, default=10, help=&quot;多线程模式的线程数，默认 10&quot;)
+    parser.add_argument(&quot;--pages&quot;, type=int, default=MAX_PAGES, help=f&quot;最多翻页数，默认 {MAX_PAGES}&quot;)
+    parser.add_argument(&quot;--limit&quot;, type=int, default=MAX_IMAGES, help=f&quot;最多下载图片数，默认 {MAX_IMAGES}&quot;)
+    return parser.parse_args()
+
+
+def main():
+    &quot;&quot;&quot;主流程：收集地址 -&gt; 按模式下载 -&gt; 打印汇总。&quot;&quot;&quot;
+    args = parse_args()
+    os.makedirs(IMG_DIR, exist_ok=True)
+
+    print(&quot;=&quot; * 78)
+    print(f&quot;目标站点：当当网搜索页    关键词：{KEYWORD}&quot;)
+    print(f&quot;约束：总页数 ≤ {args.pages} 页，图片数 ≤ {args.limit} 张，保存目录：{IMG_DIR}&quot;)
+    print(&quot;=&quot; * 78)
+
+    t0 = time.perf_counter()
+    urls, pages_done = collect_image_urls(args.pages, args.limit)
+    collect_cost = time.perf_counter() - t0
+    print(&quot;-&quot; * 78)
+    print(f&quot;[列表] 共翻 {pages_done} 页，得到 {len(urls)} 个不重复的图片地址，耗时 {collect_cost:.2f}s&quot;)
+    print(&quot;-&quot; * 78)
+
+    if not urls:
+        print(&quot;[结束] 没有拿到任何图片地址，请检查网络或页面结构是否变化&quot;)
+        return
+
+    if args.mode in (&quot;single&quot;, &quot;both&quot;):
+        print(&quot;\n&gt;&gt;&gt; 单线程下载开始&quot;)
+        ok, size, cost = download_single(urls)
+        print(f&quot;&lt;&lt;&lt; 单线程完成：成功 {ok}/{len(urls)} 张，共 {size/1024/1024:.2f} MB，耗时 {cost:.2f}s&quot;)
+
+    if args.mode in (&quot;multi&quot;, &quot;both&quot;):
+        print(f&quot;\n&gt;&gt;&gt; 多线程下载开始（{args.threads} 个线程）&quot;)
+        ok, size, cost = download_multi(urls, args.threads)
+        print(f&quot;&lt;&lt;&lt; 多线程完成：成功 {ok}/{len(urls)} 张，共 {size/1024/1024:.2f} MB，耗时 {cost:.2f}s&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre>
+<h4 id="_4">运行结果</h4>
+<p>程序先翻页收集图片地址（200px 中图地址 <code>-1_b_</code> 统一替换成原图 <code>-1_u_</code>），再进行下载：</p>
+<p><img alt="作业① 运行输出" src="shots/term_hw1.png" /></p>
+<p>实际运行数据：</p>
+<ul>
+<li>翻页：<strong>3 页</strong>后即收满，去重后得到 <strong>148 个</strong> 不重复的图片地址（第 1 页就有 60 张，第 3 页即达上限）</li>
+<li>单线程：成功 148/148 张，共 25.30 MB，耗时 <strong>71.14 s</strong></li>
+<li>多线程（10 线程）：成功 148/148 张，共 25.30 MB，耗时 <strong>3.97 s</strong></li>
+<li>加速比：<strong>17.92 倍</strong></li>
+</ul>
+<p>下载到 <code>images/</code> 子目录的图片（截图取前 36 张）：</p>
+<p><img alt="下载的图片墙" src="shots/images_wall.png" /></p>
+<p>控制台会逐条打印每张图的 URL 与字节数，满足「下载的 URL 信息在控制台输出」的要求。</p>
+<h3 id="12">1.2 心得体会</h3>
+<p><strong>1. 多线程快的原因不是「CPU 更强」，而是「等待被重叠了」。</strong></p>
+<p>这个实验最直观的收获是那个加速比。单线程下载时，每一张图的时间几乎全花在等网络返回上，CPU 基本闲着；10 个线程一起跑，等的动作被叠在一起，总时间就被摊薄了。但加速比远小于 10，说明这里存在天花板：一是当当的 CDN 对单 IP 的并发连接有节制，二是开线程本身要开销。</p>
+<p><strong>2. 线程数不能拍脑袋定。</strong></p>
+<p>这次固定用 10 个线程能跑通，但如果盲目开到 50 个，很可能被限速甚至封 IP，反而更慢。合理的做法是做一组对照实验（5/10/20/40 线程各跑一遍看耗时曲线），取拐点。我在前面几次作业里做过这个曲线，5～10 线程确实是最优区间。</p>
+<p><strong>3. 限流的本质是自律，不是技术。</strong></p>
+<p>作业要求「控制总页数和总图片数」，一开始我觉得限制爬取量是绑住手脚。真正跑完之后理解了：这类页面背后是人家的服务器和带宽，没有上限的爬虫就是一次小规模压测。<code>MAX_PAGES</code>、<code>MAX_IMAGES</code> 两个常量 + 收满即停的 <code>break</code>，代价几乎为零，但把「会不会把对方打挂」这个风险直接消掉了。</p>
+<p><strong>4. 页面结构会悄悄变，代码要能自己发现。</strong></p>
+<p>之前做同类作业时，当当商品图的真实地址在 <code>data-original</code> 属性里（<code>src</code> 是 <code>url_none.png</code> 占位图）；这次重新抓，发现已经改成 <code>src='//img3m9.ddimg.cn/...-1_b_....jpg'</code> 直接给了外链。如果照抄旧代码，提取出来全是占位图。所以提取逻辑里同时兼容 <code>src</code> 和 <code>data-original</code> 两种写法，并且抓完之后要真的看图——我这边是拼了图片墙确认每张都是书包商品图，而不是占位图。</p>
+<hr />
+<h2 id="scrapy">二、Scrapy 框架下的结构化数据采集</h2>
+<h3 id="21">2.1 代码与运行结果</h3>
+<p><strong>题目要求</strong>：熟练掌握 Scrapy 的 Item、Pipeline 数据序列化方法，用 Scrapy + XPath + MySQL 存储技术路线爬取股票信息与外汇牌价。</p>
+<p>数据库统一使用 MySQL 8.0.28（绿色解压版，端口 3306），库名 <code>spider_db</code>，两题各一张表：<code>stock_info</code>、<code>boc_forex</code>。</p>
+<h4 id="2-a-148">作业②：东方财富 A 股行情（148 只）</h4>
+<p><strong>一个绕不过去的技术坎</strong>：东方财富的行情页 <code>quote.eastmoney.com/center/gridlist.html</code> 现在完全是前端渲染，HTML 里只有骨架没有一行数据；数据由 <code>push2.eastmoney.com</code> 的接口异步推送，而且该接口对非浏览器的 TLS 指纹<strong>直接断连</strong>（<code>requests</code> 请求一律 <code>RemoteDisconnected</code>，<code>push2</code>/<code>1.push2</code>/<code>82.push2</code>/<code>push2delay</code> 各节点都试过）。用无头浏览器打开页面也渲染不出表格——页面组件依赖的外部资源在本地环境被拦断。</p>
+<p>所以采集拆成两步：先用 Playwright 驱动真实浏览器，在页面上下文内 <code>fetch</code> 接口把 JSON 取回来落盘；再由 Scrapy 的 Spider 读这份数据，走标准的 <code>Item -&gt; Pipeline -&gt; MySQL</code>。取数脚本：</p>
+<pre><code class="language-python"># -*- coding: utf-8 -*-
+&quot;&quot;&quot;作业②：东方财富行情数据采集（浏览器上下文取数）。
+
+为什么不在 Spider 里直接 requests？
+    东方财富的行情数据全部由 push2.eastmoney.com 的接口异步推送，
+    页面 HTML 里没有任何表格数据；而且该接口会对非浏览器的 TLS 指纹
+    直接断开连接（requests 请求一律 RemoteDisconnected）。
+    因此这里用 Playwright 驱动真实浏览器，在页面上下文内 fetch 接口，
+    把结果落成 JSON，交给 Scrapy 的 Spider 走 Item -&gt; Pipeline -&gt; MySQL。
+
+    XPath 的完整用法见作业③（中国银行外汇牌价），那一页是真正的
+    服务端渲染 HTML 表格，XPath 才有对象可解析。
+
+输出：data/stock_raw.json   [{seq, stock_code, stock_name, ...}, ...]
+&quot;&quot;&quot;
+
+import json
+import os
+import sys
+
+for _key in list(os.environ):
+    if &quot;proxy&quot; in _key.lower():
+        os.environ.pop(_key, None)
+
+from playwright.sync_api import sync_playwright
+
+# 目标条数：学号 102402148 后三位 148
+TARGET_COUNT = 148
+# 每页取 100 条，够 148 只只需两页
+PAGE_SIZE = 100
+
+# 沪深京 A 股板块过滤条件
+MARKET_FILTER = &quot;m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&quot;
+
+# 需要向接口索取的字段，与作业表头一一对应
+FIELDS = &quot;f12,f14,f2,f3,f4,f5,f6,f7,f15,f16,f17,f18&quot;
+
+BASE_URL = &quot;https://push2.eastmoney.com/api/qt/clist/get&quot;
+REFERER_PAGE = &quot;https://quote.eastmoney.com/center/gridlist.html&quot;
+
+OUTPUT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    &quot;..&quot;, &quot;data&quot;, &quot;stock_raw.json&quot;
+)
+
+
+def build_api_url(page_no):
+    &quot;&quot;&quot;拼出第 page_no 页的接口地址。
+
+    :param page_no: 页码，从 1 开始
+    :return: 完整 URL
+    &quot;&quot;&quot;
+    return (
+        f&quot;{BASE_URL}?pn={page_no}&amp;pz={PAGE_SIZE}&amp;po=1&amp;np=1&amp;fltt=2&amp;invt=2&quot;
+        f&quot;&amp;fid=f3&amp;fs={MARKET_FILTER}&amp;fields={FIELDS}&quot;
+    )
+
+
+def fetch_page(page, page_no):
+    &quot;&quot;&quot;在浏览器上下文里请求一页行情数据。
+
+    :param page: Playwright 的 Page 对象
+    :param page_no: 页码
+    :return: diff 列表（每项是一只股票）
+    &quot;&quot;&quot;
+    script = &quot;&quot;&quot;async (url) =&gt; {
+        const resp = await fetch(url, {credentials: 'include'});
+        return await resp.text();
+    }&quot;&quot;&quot;
+    raw = page.evaluate(script, build_api_url(page_no))
+    payload = json.loads(raw)
+    data = payload.get(&quot;data&quot;) or {}
+    return data.get(&quot;diff&quot;) or []
+
+
+def to_float(value):
+    &quot;&quot;&quot;把接口返回的数值规范化，'-' 之类的占位符返回 None。
+
+    :param value: 原始值
+    :return: float 或 None
+    &quot;&quot;&quot;
+    if value in (None, &quot;-&quot;, &quot;&quot;):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def main():
+    &quot;&quot;&quot;抓取足够条数的行情并写入 JSON。&quot;&quot;&quot;
+    rows = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            channel=&quot;msedge&quot;,
+            headless=True,
+            args=[&quot;--no-proxy-server&quot;, &quot;--disable-blink-features=AutomationControlled&quot;],
+        )
+        page = browser.new_page(viewport={&quot;width&quot;: 1440, &quot;height&quot;: 900})
+        # 先进一次东财页面，让后续 fetch 带上同源上下文
+        page.goto(REFERER_PAGE, wait_until=&quot;domcontentloaded&quot;, timeout=45000)
+        page.wait_for_timeout(3000)
+
+        page_no = 1
+        while len(rows) &lt; TARGET_COUNT:
+            diff = fetch_page(page, page_no)
+            if not diff:
+                print(f&quot;[停止] 第 {page_no} 页没有数据&quot;)
+                break
+            print(f&quot;[接口] 第 {page_no} 页取到 {len(diff)} 条&quot;)
+            rows.extend(diff)
+            page_no += 1
+            if page_no &gt; 10:
+                break
+        browser.close()
+
+    # 截断到学号规定的条数
+    rows = rows[:TARGET_COUNT]
+
+    records = []
+    for seq, row in enumerate(rows, start=1):
+        records.append({
+            &quot;seq&quot;: seq,
+            &quot;stock_code&quot;: row.get(&quot;f12&quot;),
+            &quot;stock_name&quot;: row.get(&quot;f14&quot;),
+            &quot;latest_price&quot;: to_float(row.get(&quot;f2&quot;)),
+            &quot;change_percent&quot;: to_float(row.get(&quot;f3&quot;)),
+            &quot;change_amount&quot;: to_float(row.get(&quot;f4&quot;)),
+            &quot;volume&quot;: to_float(row.get(&quot;f5&quot;)),
+            &quot;amplitude&quot;: to_float(row.get(&quot;f7&quot;)),
+            &quot;high&quot;: to_float(row.get(&quot;f15&quot;)),
+            &quot;low&quot;: to_float(row.get(&quot;f16&quot;)),
+            &quot;open_price&quot;: to_float(row.get(&quot;f17&quot;)),
+            &quot;prev_close&quot;: to_float(row.get(&quot;f18&quot;)),
+        })
+
+    out_path = os.path.abspath(OUTPUT)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, &quot;w&quot;, encoding=&quot;utf-8&quot;) as fp:
+        json.dump(records, fp, ensure_ascii=False, indent=2)
+
+    print(f&quot;[完成] 共 {len(records)} 条，已写入 {out_path}&quot;)
+    for rec in records[:3]:
+        print(&quot;  &quot;, rec)
+
+
+if __name__ == &quot;__main__&quot;:
+    sys.exit(main())
+</code></pre>
+<p>Item 定义（12 个字段与作业表头一一对应）：</p>
+<pre><code class="language-python"># -*- coding: utf-8 -*-
+&quot;&quot;&quot;作业②：股票行情数据项定义。
+
+字段与作业要求的表头一一对应：
+    序号 / 股票代码 / 股票名称 / 最新报价 / 涨跌幅 / 涨跌额
+    成交量 / 振幅 / 最高 / 最低 / 今开 / 昨收
+&quot;&quot;&quot;
+
+import scrapy
+
+
+class StockItem(scrapy.Item):
+    &quot;&quot;&quot;一条 A 股行情记录。&quot;&quot;&quot;
+
+    # 序号，按抓取顺序编号
+    seq = scrapy.Field()
+    # 股票代码，例如 301348
+    stock_code = scrapy.Field()
+    # 股票名称，例如 蓝箭电子
+    stock_name = scrapy.Field()
+    # 最新报价（元）
+    latest_price = scrapy.Field()
+    # 涨跌幅，单位 %
+    change_percent = scrapy.Field()
+    # 涨跌额（元）
+    change_amount = scrapy.Field()
+    # 成交量（手）
+    volume = scrapy.Field()
+    # 振幅，单位 %
+    amplitude = scrapy.Field()
+    # 当日最高价
+    high = scrapy.Field()
+    # 当日最低价
+    low = scrapy.Field()
+    # 今开价
+    open_price = scrapy.Field()
+    # 昨收价
+    prev_close = scrapy.Field()
+</code></pre>
+<p>Pipeline（建表 + 入库，按股票代码唯一键去重）：</p>
+<pre><code class="language-python"># -*- coding: utf-8 -*-
+&quot;&quot;&quot;作业②：股票行情数据管道——写入 MySQL。
+
+与作业③ 使用同一个库 spider_db，表名 stock_info。
+字段类型按「金额三位小数、成交量整数」设计，避免数值被截断。
+&quot;&quot;&quot;
+
+from datetime import datetime
+
+import pymysql
+
+DB_CONF = {
+    &quot;host&quot;: &quot;127.0.0.1&quot;,
+    &quot;port&quot;: 3306,
+    &quot;user&quot;: &quot;root&quot;,
+    &quot;password&quot;: &quot;123456&quot;,
+    &quot;charset&quot;: &quot;utf8mb4&quot;,
+}
+
+
+class MysqlPipeline:
+    &quot;&quot;&quot;把 StockItem 写入 MySQL 的 stock_info 表。&quot;&quot;&quot;
+
+    def __init__(self):
+        &quot;&quot;&quot;初始化连接占位。&quot;&quot;&quot;
+        self.conn = None
+        self.cursor = None
+
+    def open_spider(self, spider):
+        &quot;&quot;&quot;启动时连库、建库建表。
+
+        :param spider: 当前爬虫实例
+        &quot;&quot;&quot;
+        self.conn = pymysql.connect(**DB_CONF, autocommit=False)
+        self.cursor = self.conn.cursor()
+        self.cursor.execute(
+            &quot;CREATE DATABASE IF NOT EXISTS spider_db &quot;
+            &quot;DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci&quot;
+        )
+        self.cursor.execute(&quot;USE spider_db&quot;)
+        self.cursor.execute(
+            &quot;&quot;&quot;
+            CREATE TABLE IF NOT EXISTS stock_info (
+                id INT AUTO_INCREMENT PRIMARY KEY COMMENT '自增主键',
+                seq INT NULL COMMENT '序号',
+                stock_code VARCHAR(10) NOT NULL COMMENT '股票代码',
+                stock_name VARCHAR(32) NULL COMMENT '股票名称',
+                latest_price DECIMAL(12,3) NULL COMMENT '最新报价',
+                change_percent DECIMAL(10,3) NULL COMMENT '涨跌幅%',
+                change_amount DECIMAL(10,3) NULL COMMENT '涨跌额',
+                volume BIGINT NULL COMMENT '成交量(手)',
+                amplitude DECIMAL(10,3) NULL COMMENT '振幅%',
+                high_price DECIMAL(12,3) NULL COMMENT '最高',
+                low_price DECIMAL(12,3) NULL COMMENT '最低',
+                open_price DECIMAL(12,3) NULL COMMENT '今开',
+                prev_close DECIMAL(12,3) NULL COMMENT '昨收',
+                crawl_time DATETIME NULL COMMENT '采集时间',
+                UNIQUE KEY uk_code (stock_code)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='A股实时行情'
+            &quot;&quot;&quot;
+        )
+        self.conn.commit()
+        spider.logger.info(&quot;stock_info 表已就绪&quot;)
+
+    def process_item(self, item, spider):
+        &quot;&quot;&quot;单条 Item 入库，同一代码重复则覆盖。
+
+        :param item: StockItem 实例
+        :param spider: 当前爬虫实例
+        :return: 原样返回 item
+        &quot;&quot;&quot;
+        sql = (
+            &quot;INSERT INTO stock_info &quot;
+            &quot;(seq, stock_code, stock_name, latest_price, change_percent, change_amount, &quot;
+            &quot; volume, amplitude, high_price, low_price, open_price, prev_close, crawl_time) &quot;
+            &quot;VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) &quot;
+            &quot;ON DUPLICATE KEY UPDATE &quot;
+            &quot;seq=VALUES(seq), stock_name=VALUES(stock_name), latest_price=VALUES(latest_price), &quot;
+            &quot;change_percent=VALUES(change_percent), change_amount=VALUES(change_amount), &quot;
+            &quot;volume=VALUES(volume), amplitude=VALUES(amplitude), high_price=VALUES(high_price), &quot;
+            &quot;low_price=VALUES(low_price), open_price=VALUES(open_price), &quot;
+            &quot;prev_close=VALUES(prev_close), crawl_time=VALUES(crawl_time)&quot;
+        )
+        self.cursor.execute(
+            sql,
+            (
+                item.get(&quot;seq&quot;),
+                item.get(&quot;stock_code&quot;),
+                item.get(&quot;stock_name&quot;),
+                item.get(&quot;latest_price&quot;),
+                item.get(&quot;change_percent&quot;),
+                item.get(&quot;change_amount&quot;),
+                item.get(&quot;volume&quot;),
+                item.get(&quot;amplitude&quot;),
+                item.get(&quot;high&quot;),
+                item.get(&quot;low&quot;),
+                item.get(&quot;open_price&quot;),
+                item.get(&quot;prev_close&quot;),
+                datetime.now().strftime(&quot;%Y-%m-%d %H:%M:%S&quot;),
+            ),
+        )
+        self.conn.commit()
+        return item
+
+    def close_spider(self, spider):
+        &quot;&quot;&quot;收尾关闭连接。
+
+        :param spider: 当前爬虫实例
+        &quot;&quot;&quot;
+        if self.cursor:
+            self.cursor.close()
+        if self.conn:
+            self.conn.close()
+        spider.logger.info(&quot;数据库连接已关闭&quot;)
+</code></pre>
+<p>Spider（Scrapy 2.13 以后不再调用 <code>start_requests()</code>，这里用 <code>async start()</code> 直接产出 Item）：</p>
+<pre><code class="language-python"># -*- coding: utf-8 -*-
+&quot;&quot;&quot;作业②：A 股行情 Spider。
+
+数据来源说明：
+    东方财富的行情页（quote.eastmoney.com/center/gridlist.html）是纯前端渲染，
+    HTML 里只有骨架，数据由 push2.eastmoney.com 的接口异步推送，且该接口对
+    非浏览器请求直接断连。因此采集分两步：
+        1. fetch_stock_data.py  用 Playwright 在浏览器上下文里请求接口，
+           把 148 条原始行情落成 data/stock_raw.json；
+        2. 本 Spider 读取该文件，逐条产出 StockItem，交给 Pipeline 写 MySQL。
+
+    Scrapy 2.13 以后不再调用 start_requests()，这里用 async start() 直接
+    产出 Item，Item 会正常流经 ITEM_PIPELINES。
+&quot;&quot;&quot;
+
+import json
+import os
+
+import scrapy
+
+from stock.items import StockItem
+
+# 原始数据文件：code/stock/stock/spiders -&gt; 上四级 -&gt; 第三次作业/data
+JSON_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), &quot;..&quot;, &quot;..&quot;, &quot;..&quot;, &quot;..&quot;, &quot;data&quot;, &quot;stock_raw.json&quot;)
+)
+
+
+class StockSpider(scrapy.Spider):
+    &quot;&quot;&quot;把采集好的行情记录逐条送入管道。&quot;&quot;&quot;
+
+    name = &quot;stock&quot;
+    allowed_domains = []
+
+    async def start(self):
+        &quot;&quot;&quot;Scrapy 2.13+ 的入口：直接产出 Item。
+
+        :yield: StockItem
+        &quot;&quot;&quot;
+        if not os.path.exists(JSON_PATH):
+            self.logger.error(&quot;找不到原始数据文件：%s，请先运行 fetch_stock_data.py&quot;, JSON_PATH)
+            return
+
+        with open(JSON_PATH, &quot;r&quot;, encoding=&quot;utf-8&quot;) as fp:
+            records = json.load(fp)
+
+        self.logger.info(&quot;从 %s 读到 %d 条行情&quot;, JSON_PATH, len(records))
+        for rec in records:
+            item = StockItem()
+            for field in item.fields:
+                item[field] = rec.get(field)
+            yield item
+</code></pre>
+<p><strong>入库结果</strong>：MySQL 中 <code>stock_info</code> 共 <strong>148 条</strong>，与学号后三位一致。</p>
+<p><img alt="股票数据入库结果" src="shots/db_stock.png" /></p>
+<h4 id="3xpath">作业③：中国银行外汇牌价（XPath 实战）</h4>
+<p>这一题是 XPath 真正发挥作用的场景——<code>https://www.boc.cn/sourcedb/whpj/</code> 是<strong>服务端渲染的 HTML 表格</strong>，页面结构干净：</p>
+<pre><code>&lt;table&gt;
+  &lt;tr&gt;&lt;td colspan=...&gt;【点击进入历史牌价检索】...&lt;/td&gt;&lt;/tr&gt;
+  &lt;tr&gt;&lt;th&gt;货币名称&lt;/th&gt;&lt;th&gt;现汇买入价&lt;/th&gt;&lt;th&gt;现钞买入价&lt;/th&gt;...&lt;/tr&gt;
+  &lt;tr&gt;&lt;td&gt;阿联酋迪拉姆&lt;/td&gt;&lt;td&gt;180.90&lt;/td&gt;&lt;td&gt;180.90&lt;/td&gt;...&lt;/tr&gt;
+&lt;/table&gt;
+</code></pre>
+<p>Item：</p>
+<pre><code class="language-python"># -*- coding: utf-8 -*-
+&quot;&quot;&quot;作业③：中国银行外汇牌价数据项定义。
+
+把页面表格的一行映射成一个 Item，字段名与作业要求的三列表头保持一致
+（Currency / TBP / CBP / TSP / CSP / Time）。
+&quot;&quot;&quot;
+
+import scrapy
+
+
+class ForexItem(scrapy.Item):
+    &quot;&quot;&quot;一条外汇牌价记录。&quot;&quot;&quot;
+
+    # 货币名称，例如「阿联酋迪拉姆」
+    currency = scrapy.Field()
+    # 现汇买入价（Telegraphic Buying Price）
+    tbp = scrapy.Field()
+    # 现钞买入价（Cash Buying Price）
+    cbp = scrapy.Field()
+    # 现汇卖出价（Telegraphic Selling Price）
+    tsp = scrapy.Field()
+    # 现钞卖出价（Cash Selling Price）
+    csp = scrapy.Field()
+    # 中行折算价（Bank of China Conversion Price），页面有该列，一并保留
+    boccp = scrapy.Field()
+    # 牌价发布时间，例如 2026/11/19 23:45:51
+    quote_time = scrapy.Field()
+    # 采集时间，由管道写入，便于区分多次采集
+    crawl_time = scrapy.Field()
+</code></pre>
+<p>Spider 用 XPath 逐行扫描，靠「单元格数 = 7」和「首列不等于表头文字」两条规则跳过导航行与表头，比写死下标稳健：</p>
+<pre><code class="language-python"># -*- coding: utf-8 -*-
+&quot;&quot;&quot;作业③：中国银行外汇牌价 Spider。
+
+目标站点：https://www.boc.cn/sourcedb/whpj/
+页面为服务端渲染的 HTML 表格，直接用 XPath 定位每个 tr / td 即可拿到数据。
+&quot;&quot;&quot;
+
+import scrapy
+
+from forex.items import ForexItem
+
+
+class ForexSpider(scrapy.Spider):
+    &quot;&quot;&quot;抓取中国银行外汇牌价页面上的全部币种。&quot;&quot;&quot;
+
+    name = &quot;forex&quot;
+    allowed_domains = [&quot;boc.cn&quot;]
+    start_urls = [&quot;https://www.boc.cn/sourcedb/whpj/&quot;]
+
+    # 表头关键字，用于跳过表头行而不是靠固定下标
+    HEADER_WORD = &quot;货币名称&quot;
+
+    def parse(self, response):
+        &quot;&quot;&quot;解析牌价表格。
+
+        页面结构：
+            &lt;table&gt;
+              &lt;tr&gt;&lt;td colspan=..&gt;【点击进入历史牌价检索】...&lt;/td&gt;&lt;/tr&gt;
+              &lt;tr&gt;&lt;th&gt;货币名称&lt;/th&gt;&lt;th&gt;现汇买入价&lt;/th&gt;...&lt;/tr&gt;
+              &lt;tr&gt;&lt;td&gt;阿联酋迪拉姆&lt;/td&gt;&lt;td&gt;180.79&lt;/td&gt;...&lt;/tr&gt;
+            &lt;/table&gt;
+
+        :param response: 牌价页面响应
+        :yield: ForexItem
+        &quot;&quot;&quot;
+        # 逐行扫描表格，只保留有 7 个单元格的数据行
+        for tr in response.xpath(&quot;//table//tr&quot;):
+            tds = tr.xpath(&quot;./td&quot;)
+            if len(tds) &lt; 7:
+                continue
+
+            # 取每个单元格的纯文本并去空白
+            cells = [self._clean(td.xpath(&quot;string(.)&quot;).get()) for td in tds]
+            if not cells or cells[0] == self.HEADER_WORD:
+                continue
+
+            item = ForexItem()
+            item[&quot;currency&quot;] = cells[0]
+            item[&quot;tbp&quot;] = cells[1]
+            item[&quot;cbp&quot;] = cells[2]
+            item[&quot;tsp&quot;] = cells[3]
+            item[&quot;csp&quot;] = cells[4]
+            item[&quot;boccp&quot;] = cells[5]
+            item[&quot;quote_time&quot;] = cells[6]
+            yield item
+
+    @staticmethod
+    def _clean(text):
+        &quot;&quot;&quot;去除文本中的空白与不间断空格。
+
+        :param text: 原始文本
+        :return: 清理后的字符串
+        &quot;&quot;&quot;
+        if text is None:
+            return &quot;&quot;
+        return text.replace(&quot;\xa0&quot;, &quot; &quot;).strip()
+</code></pre>
+<p><strong>入库结果</strong>：<code>boc_forex</code> 共 <strong>45 条</strong>（页面上的全部币种）。</p>
+<p><img alt="外汇数据入库结果" src="shots/db_forex.png" /></p>
+<p>部分币种的现汇买卖价为空（如文莱元、巴西雷亚尔只有现钞价），页面原文即为空，入库时保留为 <code>NULL</code> 而不是填 0，避免混淆「没有报价」和「报价为 0」。</p>
+<p>代码截图（Pygments 高亮）：</p>
+<p><img alt="作业② Item" src="shots/code_hw2_items_01.png" /></p>
+<p><img alt="作业③ Spider" src="shots/code_hw3_spider_01.png" /></p>
+<h3 id="22">2.2 心得体会</h3>
+<p><strong>1. Item 和 Pipeline 分离，价值在「换存储不用动爬虫」。</strong></p>
+<p>一开始觉得 Item 只是一堆字段声明，很啰嗦。真正写完之后发现：Spider 只负责「从页面里把数据抠出来」，Pipeline 只负责「把数据放进去」。后来我想把外汇数据同时导一份 CSV 做核对，只需要在 <code>ITEM_PIPELINES</code> 里再加一个管道，爬虫代码一行没动。这就是分层的好处——变化被关在各自那一层里。</p>
+<p><strong>2. XPath 的前提是「页面里真的有 HTML」。</strong></p>
+<p>作业② 是这次最深的教训。XPath 再熟也没用——对象根本不存在。东方财富把行情做成了纯 JSON 接口，页面上没有表格节点，<code>response.xpath()</code> 拿到的只有骨架。这不是 XPath 的问题，而是「解析方法必须匹配数据的形态」：数据在 HTML 里用 XPath，数据在 JSON 里就该用字典取键。作业③ 的中行牌价页则相反，老老实实的 HTML 表格，几行 XPath 就取完了。<strong>同一门课的两道题，恰好演示了这两种情况。</strong></p>
+<p><strong>3. 反爬不是「加个 UA」就能过。</strong></p>
+<p><code>requests</code> 请求东财接口被断连，但同一个 URL 在浏览器里 <code>fetch</code> 就 200——差别不在 header，而在 TLS 握手指纹。这说明服务端能做的不只是看 UA，还能看连接本身的特征。遇到这种拦截，硬刚没有意义，正确做法是让程序「真的像一个浏览器」（本作业用的是 Playwright），或者换一个数据源。识别出「这是指纹层面的拦截而不是我的参数写错了」，比多试十次 header 有用得多。</p>
+<p><strong>4. 数据库字段类型是设计决策，不是随手写。</strong></p>
+<p><code>latest_price DECIMAL(12,3)</code>、<code>volume BIGINT</code>、<code>change_percent DECIMAL(10,3)</code>——这些不是随便挑的。价格用 <code>DECIMAL</code> 而不是 <code>FLOAT</code>，是因为浮点数存钱会出现 <code>21.659999847</code> 这种尾巴；成交量用 <code>BIGINT</code> 是因为「手」数乘 100 后可能过亿。另外两张表都加了唯一键（<code>stock_code</code> / <code>(currency, quote_time)</code>），配合 <code>ON DUPLICATE KEY UPDATE</code>，同一份数据重跑不会产生重复行——这一点在调试阶段反复跑爬虫时太重要了。</p>
+<p><strong>5. 一个环境上的坑：中文路径。</strong></p>
+<p>MySQL 8.0.28 解压在 <code>C:\Users\周凯\WorkBuddy\数据采集与融合\...</code> 下初始化时，一直报 <code>Can't find error-message file</code>，排查后发现是 mysqld 按系统 ANSI 编码解析路径，中文目录被解成了乱码，所有文件都「找不到」。把整个 MySQL 挪到纯英文路径 <code>E:/mysql8</code> 后一次就过。这类问题跟爬虫技术无关，但会卡住整个实验，值得记一笔。</p>
+</body></html>
